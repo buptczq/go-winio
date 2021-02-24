@@ -84,6 +84,9 @@ const (
 	cFILE_PIPE_REJECT_REMOTE_CLIENTS = 2
 
 	cSE_DACL_PRESENT = 4
+
+	cBACKLOG        = 16
+	cLISTEN_ROUTINE = 4
 )
 
 var (
@@ -387,29 +390,45 @@ func (l *win32PipeListener) makeConnectedServerPipe() (*win32File, error) {
 	return p, err
 }
 
-func (l *win32PipeListener) listenerRoutine() {
-	closed := false
-	for !closed {
-		select {
-		case <-l.closeCh:
-			closed = true
-		case responseCh := <-l.acceptCh:
-			var (
-				p   *win32File
-				err error
-			)
-			for {
-				p, err = l.makeConnectedServerPipe()
-				// If the connection was immediately closed by the client, try
-				// again.
-				if err != cERROR_NO_DATA {
-					break
-				}
+func (l *win32PipeListener) backlogRoutine(backlog chan acceptResponse, cancel context.CancelFunc) {
+	for {
+		var (
+			p   *win32File
+			err error
+		)
+		for {
+			p, err = l.makeConnectedServerPipe()
+			// If the connection was immediately closed by the client, try
+			// again.
+			if err != cERROR_NO_DATA {
+				break
 			}
-			responseCh <- acceptResponse{p, err}
-			closed = err == ErrPipeListenerClosed
+		}
+		backlog <- acceptResponse{p, err}
+		if err == ErrPipeListenerClosed {
+			cancel()
 		}
 	}
+}
+
+func (l *win32PipeListener) listenerRoutine() {
+	backlog := make(chan acceptResponse, cBACKLOG)
+	ctx, cancel := context.WithCancel(context.Background())
+	for i := 0; i < cLISTEN_ROUTINE; i++ {
+		go l.backlogRoutine(backlog, cancel)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			goto end
+		case <-l.closeCh:
+			cancel()
+		case responseCh := <-l.acceptCh:
+			resp := <-backlog
+			responseCh <- resp
+		}
+	}
+end:
 	syscall.Close(l.firstHandle)
 	l.firstHandle = 0
 	// Notify Close() and Accept() callers that the handle has been closed.
